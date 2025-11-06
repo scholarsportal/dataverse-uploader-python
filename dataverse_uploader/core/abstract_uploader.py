@@ -74,6 +74,9 @@ class AbstractUploader(ABC):
         logger.info(f"List only: {self.config.list_only}")
         logger.info("=" * 80)
         
+        # Track failed uploads for retry
+        self.failed_uploads: list[tuple[Resource, str]] = []
+        
         try:
             # Validate configuration
             self.validate_configuration()
@@ -88,6 +91,10 @@ class AbstractUploader(ABC):
                 resource = FileResource(path)
                 self._process_resource(resource, parent_path="/")
             
+            # Retry failed uploads with delays
+            if self.failed_uploads and not self.config.list_only:
+                self._retry_failed_uploads()
+            
             # Print summary
             self._print_summary()
             
@@ -96,6 +103,74 @@ class AbstractUploader(ABC):
             raise
         finally:
             self.http_client.close()
+
+    def _retry_failed_uploads(self) -> None:
+        """Retry failed uploads with exponential backoff.
+        
+        Sometimes Dataverse is still processing previous uploads,
+        causing temporary failures. This retries those uploads.
+        """
+        import time
+        
+        max_retry_attempts = 3
+        retry_delay = 5  # seconds
+        
+        for attempt in range(1, max_retry_attempts + 1):
+            if not self.failed_uploads:
+                break
+            
+            logger.info("=" * 80)
+            logger.info(f"Retry attempt {attempt}/{max_retry_attempts} for {len(self.failed_uploads)} failed file(s)")
+            logger.info(f"Waiting {retry_delay} seconds for Dataverse to finish processing...")
+            logger.info("=" * 80)
+            
+            time.sleep(retry_delay)
+            
+            # Reload existing files (some may have been processed)
+            if hasattr(self, '_load_existing_files'):
+                try:
+                    self._load_existing_files()
+                except Exception as e:
+                    logger.warning(f"Could not reload existing files: {e}")
+            
+            # Try uploading failed files again
+            still_failed = []
+            for resource, parent_path in self.failed_uploads:
+                logger.info(f"Retrying: {resource.get_name()}")
+                
+                # Check if it now exists (may have been processed)
+                existing_id = self.get_existing_resource_id(resource, parent_path)
+                if existing_id:
+                    logger.info(f"File now exists (was being processed): {resource.get_name()}")
+                    self.skipped_files += 1
+                    self.failed_files -= 1  # It wasn't really failed, just processing
+                    continue
+                
+                # Try uploading again
+                file_id = self.upload_file(resource, parent_path)
+                
+                if file_id:
+                    self.uploaded_files += 1
+                    self.uploaded_bytes += resource.length()
+                    self.failed_files -= 1
+                    logger.info(f"Successfully uploaded on retry: {resource.get_name()}")
+                else:
+                    # Still failed, add back to list
+                    still_failed.append((resource, parent_path))
+                    
+                # Small delay between retries
+                time.sleep(2)
+            
+            # Update failed list
+            self.failed_uploads = still_failed
+            
+            # Increase delay for next attempt (exponential backoff)
+            retry_delay *= 2
+        
+        if self.failed_uploads:
+            logger.warning(f"{len(self.failed_uploads)} file(s) still failed after {max_retry_attempts} retry attempts")
+            for resource, _ in self.failed_uploads:
+                logger.warning(f"  - {resource.get_name()}")
 
     def _process_resource(self, resource: Resource, parent_path: str) -> Optional[str]:
         """Recursively process a resource (file or directory).
@@ -204,6 +279,11 @@ class AbstractUploader(ABC):
             self.uploaded_files += 1
             self.uploaded_bytes += file.length()
             logger.info(f"Successfully uploaded: {file.get_name()}")
+        else:
+            # Track failed upload for retry
+            self.failed_files += 1
+            if hasattr(self, 'failed_uploads'):
+                self.failed_uploads.append((file, parent_path))
         
         return file_id
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dataverse-uploader"
-version = "1.3.0"
+version = "1.4.1"
 description = "Command-line bulk uploader for Dataverse repositories"
 readme = "README.md"
 requires-python = ">=3.9"
