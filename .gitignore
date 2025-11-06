@@ -179,6 +179,8 @@ $RECYCLE.BIN/
 *.xlsx
 *.docx
 *.pdf
+*.gif
+demo.yml
 test_data/
 uploads/
 downloads/
