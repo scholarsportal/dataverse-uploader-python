@@ -182,6 +182,8 @@ $RECYCLE.BIN/
 test_data/
 uploads/
 downloads/
+data/
+exemple/data/
 temp/
 tmp/
 
