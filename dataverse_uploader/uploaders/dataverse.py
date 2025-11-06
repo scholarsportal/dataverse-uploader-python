@@ -31,6 +31,7 @@ class DataverseUploader(AbstractUploader):
         super().__init__(config)
         self.dataset_metadata: Optional[dict] = None
         self.existing_files: dict[str, dict] = {}
+        self.existing_files_by_checksum: dict[str, dict] = {}
 
     def validate_configuration(self) -> None:
         """Validate Dataverse-specific configuration.
@@ -94,7 +95,9 @@ class DataverseUploader(AbstractUploader):
             
             files = data.get("data", [])
             
-            # Build map of path -> file info
+            # Build map of path -> file info AND checksum -> file info
+            self.existing_files_by_checksum = {}
+            
             for file_info in files:
                 file_path = file_info.get("directoryLabel", "")
                 if file_path:
@@ -103,12 +106,20 @@ class DataverseUploader(AbstractUploader):
                     file_path = file_info.get("label", "")
                 
                 checksum_info = file_info.get("dataFile", {}).get("checksum", {})
+                checksum_value = checksum_info.get("value", "").lower()
                 
-                self.existing_files[file_path] = {
+                file_data = {
                     "id": file_info.get("dataFile", {}).get("id"),
                     "checksum_type": checksum_info.get("type", "MD5"),
-                    "checksum_value": checksum_info.get("value", ""),
+                    "checksum_value": checksum_value,
+                    "path": file_path,
                 }
+                
+                self.existing_files[file_path] = file_data
+                
+                # Also store by checksum for content-based duplicate detection
+                if checksum_value:
+                    self.existing_files_by_checksum[checksum_value] = file_data
             
             logger.info(f"Found {len(self.existing_files)} existing files")
             
@@ -119,6 +130,9 @@ class DataverseUploader(AbstractUploader):
         self, resource: Resource, parent_path: str
     ) -> Optional[str]:
         """Check if resource exists in Dataverse.
+        
+        Uses both filename and content hash to detect duplicates.
+        Handles Dataverse's conversion of tabular files to .tab format.
         
         Args:
             resource: Resource to check
@@ -134,7 +148,47 @@ class DataverseUploader(AbstractUploader):
         # Build the file path as Dataverse would see it
         file_path = f"{parent_path.strip('/')}/{resource.get_name()}".lstrip("/")
         
-        return self.existing_files.get(file_path, {}).get("id")
+        # First check by exact filename
+        if file_path in self.existing_files:
+            logger.info(f"File exists (by name): {file_path}")
+            return self.existing_files[file_path].get("id")
+        
+        # Dataverse converts tabular files to .tab - check for that too
+        # Supported formats: CSV, Excel, SPSS, Stata, SAS, etc.
+        tabular_extensions = ['.csv', '.xlsx', '.xls', '.sav', '.dta', '.por', 
+                             '.sas7bdat', '.rdata', '.rds']
+        
+        file_lower = file_path.lower()
+        for ext in tabular_extensions:
+            if file_lower.endswith(ext):
+                # Replace extension with .tab
+                tab_path = file_path[:-len(ext)] + '.tab'
+                if tab_path in self.existing_files:
+                    logger.info(f"File exists as {tab_path} (tabular file converted to TAB)")
+                    return self.existing_files[tab_path].get("id")
+                break
+        
+        # Check in directory paths too (e.g., "data/customers.csv" -> "data/customers.tab")
+        if '/' in file_path or '\\' in file_path:
+            # Normalize path separators
+            normalized_path = file_path.replace('\\', '/')
+            for ext in tabular_extensions:
+                if normalized_path.lower().endswith(ext):
+                    tab_path = normalized_path[:-len(ext)] + '.tab'
+                    if tab_path in self.existing_files:
+                        logger.info(f"File exists as {tab_path} (tabular file converted to TAB)")
+                        return self.existing_files[tab_path].get("id")
+                    break
+        
+        # Finally, check by content hash to catch duplicates with different names
+        if self.config.verify_checksums:
+            file_hash = resource.get_hash("md5").lower()
+            if file_hash in self.existing_files_by_checksum:
+                existing_file = self.existing_files_by_checksum[file_hash]
+                logger.info(f"File exists with same content as: {existing_file['path']}")
+                return existing_file.get("id")
+        
+        return None
 
     def create_directory(self, directory: Resource, parent_path: str) -> str:
         """Dataverse doesn't explicitly create directories.
