@@ -1,9 +1,21 @@
-"""Abstract base class for repository uploaders."""
+"""Abstract base class for repository uploaders with progress tracking."""
 
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional
+
+from rich.console import Console
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    BarColumn,
+    TaskProgressColumn,
+    TimeRemainingColumn,
+    FileSizeColumn,
+    TransferSpeedColumn,
+)
 
 from dataverse_uploader.core.config import UploaderConfig
 from dataverse_uploader.core.exceptions import UploaderException
@@ -12,6 +24,7 @@ from dataverse_uploader.resources.file_resource import FileResource
 from dataverse_uploader.utils.http_client import HTTPClient
 
 logger = logging.getLogger(__name__)
+console = Console()
 
 
 class AbstractUploader(ABC):
@@ -42,6 +55,10 @@ class AbstractUploader(ABC):
         # ID mappings for tracking uploaded resources
         self.resource_id_map: dict[str, str] = {}
         
+        # Progress tracking
+        self.progress: Optional[Progress] = None
+        self.upload_task: Optional[int] = None
+        
         self._setup_logging()
 
     def _setup_logging(self):
@@ -61,18 +78,42 @@ class AbstractUploader(ABC):
             file_handler.setFormatter(formatter)
             logger.addHandler(file_handler)
 
+    def _count_files_to_process(self, paths: list[str | Path]) -> int:
+        """Count total files that will be processed.
+        
+        Args:
+            paths: List of paths to process
+            
+        Returns:
+            Total number of files
+        """
+        total = 0
+        for path_str in paths:
+            path = Path(path_str)
+            if not path.exists():
+                continue
+            
+            if path.is_file():
+                total += 1
+            elif path.is_dir() and self.config.recurse_directories:
+                for item in path.rglob("*"):
+                    if item.is_file() and not item.name.startswith("."):
+                        total += 1
+        return total
+
     def process_requests(self, paths: list[str | Path]) -> None:
         """Process upload requests for the given paths.
         
         Args:
             paths: List of file or directory paths to upload
         """
-        logger.info("=" * 80)
-        logger.info("Starting upload process")
-        logger.info(f"Server: {self.config.server_url}")
-        logger.info(f"Dataset: {self.config.dataset_pid}")
-        logger.info(f"List only: {self.config.list_only}")
-        logger.info("=" * 80)
+        console.print("\n[bold cyan]═" * 70)
+        console.print(f"[bold cyan]Starting Upload Process")
+        console.print(f"[cyan]Server:[/cyan] {self.config.server_url}")
+        console.print(f"[cyan]Dataset:[/cyan] {self.config.dataset_pid}")
+        if self.config.list_only:
+            console.print("[yellow]LIST ONLY MODE - No files will be uploaded[/yellow]")
+        console.print("[bold cyan]═" * 70 + "\n")
         
         # Track failed uploads for retry
         self.failed_uploads: list[tuple[Resource, str]] = []
@@ -81,18 +122,58 @@ class AbstractUploader(ABC):
             # Validate configuration
             self.validate_configuration()
             
-            # Process each path
-            for path_str in paths:
-                path = Path(path_str)
-                if not path.exists():
-                    logger.warning(f"Path does not exist: {path}")
-                    continue
+            # Count total files
+            total_files_to_process = self._count_files_to_process(paths)
+            
+            # Create progress bar
+            if not self.config.list_only:
+                self.progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold blue]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    TextColumn("•"),
+                    FileSizeColumn(),
+                    TextColumn("•"),
+                    TransferSpeedColumn(),
+                    TextColumn("•"),
+                    TimeRemainingColumn(),
+                    console=console,
+                )
                 
-                resource = FileResource(path)
-                self._process_resource(resource, parent_path="/")
+                with self.progress:
+                    self.upload_task = self.progress.add_task(
+                        "Uploading files...",
+                        total=total_files_to_process
+                    )
+                    
+                    # Process each path
+                    for path_str in paths:
+                        path = Path(path_str)
+                        if not path.exists():
+                            logger.warning(f"Path does not exist: {path}")
+                            continue
+                        
+                        resource = FileResource(path)
+                        self._process_resource(resource, parent_path="/")
+                    
+                    # Complete the progress bar
+                    if self.upload_task is not None:
+                        self.progress.update(self.upload_task, completed=total_files_to_process)
+            else:
+                # List only mode - no progress bar
+                for path_str in paths:
+                    path = Path(path_str)
+                    if not path.exists():
+                        logger.warning(f"Path does not exist: {path}")
+                        continue
+                    
+                    resource = FileResource(path)
+                    self._process_resource(resource, parent_path="/")
             
             # Retry failed uploads with delays
             if self.failed_uploads and not self.config.list_only:
+                console.print()  # Add blank line
                 self._retry_failed_uploads()
             
             # Print summary
@@ -119,10 +200,10 @@ class AbstractUploader(ABC):
             if not self.failed_uploads:
                 break
             
-            logger.info("=" * 80)
-            logger.info(f"Retry attempt {attempt}/{max_retry_attempts} for {len(self.failed_uploads)} failed file(s)")
-            logger.info(f"Waiting {retry_delay} seconds for Dataverse to finish processing...")
-            logger.info("=" * 80)
+            console.print("[bold yellow]" + "═" * 70)
+            console.print(f"[bold yellow]Retry Attempt {attempt}/{max_retry_attempts} for {len(self.failed_uploads)} failed file(s)")
+            console.print(f"[yellow]Waiting {retry_delay} seconds for Dataverse to finish processing...")
+            console.print("[bold yellow]" + "═" * 70 + "\n")
             
             time.sleep(retry_delay)
             
@@ -136,12 +217,12 @@ class AbstractUploader(ABC):
             # Try uploading failed files again
             still_failed = []
             for resource, parent_path in self.failed_uploads:
-                logger.info(f"Retrying: {resource.get_name()}")
+                console.print(f"[yellow]Retrying:[/yellow] {resource.get_name()}")
                 
                 # Check if it now exists (may have been processed)
                 existing_id = self.get_existing_resource_id(resource, parent_path)
                 if existing_id:
-                    logger.info(f"File now exists (was being processed): {resource.get_name()}")
+                    console.print(f"[green]✓[/green] File now exists (was being processed): {resource.get_name()}")
                     self.skipped_files += 1
                     self.failed_files -= 1  # It wasn't really failed, just processing
                     continue
@@ -153,7 +234,7 @@ class AbstractUploader(ABC):
                     self.uploaded_files += 1
                     self.uploaded_bytes += resource.length()
                     self.failed_files -= 1
-                    logger.info(f"Successfully uploaded on retry: {resource.get_name()}")
+                    console.print(f"[green]✓[/green] Successfully uploaded on retry: {resource.get_name()}")
                 else:
                     # Still failed, add back to list
                     still_failed.append((resource, parent_path))
@@ -168,9 +249,9 @@ class AbstractUploader(ABC):
             retry_delay *= 2
         
         if self.failed_uploads:
-            logger.warning(f"{len(self.failed_uploads)} file(s) still failed after {max_retry_attempts} retry attempts")
+            console.print(f"\n[bold red]⚠[/bold red] {len(self.failed_uploads)} file(s) still failed after {max_retry_attempts} retry attempts")
             for resource, _ in self.failed_uploads:
-                logger.warning(f"  - {resource.get_name()}")
+                console.print(f"  [red]✗[/red] {resource.get_name()}")
 
     def _process_resource(self, resource: Resource, parent_path: str) -> Optional[str]:
         """Recursively process a resource (file or directory).
@@ -215,7 +296,10 @@ class AbstractUploader(ABC):
         Returns:
             Directory ID if created
         """
-        logger.info(f"Processing directory: {directory.get_path()}")
+        if not self.config.list_only:
+            console.print(f"[cyan]📁 Processing directory:[/cyan] {directory.get_path()}")
+        else:
+            console.print(f"[dim]Would process directory: {directory.get_path()}[/dim]")
         
         # Check if directory exists in repository
         dir_id = self.get_existing_resource_id(directory, parent_path)
@@ -246,7 +330,19 @@ class AbstractUploader(ABC):
         Returns:
             File ID if uploaded
         """
-        logger.info(f"Processing file: {file.get_path()} ({file.length()} bytes)")
+        # Format file size
+        file_size = file.length()
+        if file_size < 1024:
+            size_str = f"{file_size} B"
+        elif file_size < 1024 * 1024:
+            size_str = f"{file_size / 1024:.1f} KB"
+        else:
+            size_str = f"{file_size / (1024 * 1024):.1f} MB"
+        
+        if not self.config.list_only:
+            console.print(f"[cyan]📄 Processing:[/cyan] {file.get_name()} [dim]({size_str})[/dim]")
+        else:
+            console.print(f"[dim]Would upload: {file.get_path()} ({size_str})[/dim]")
         
         # Check if file exists in repository
         existing_id = self.get_existing_resource_id(file, parent_path)
@@ -255,21 +351,26 @@ class AbstractUploader(ABC):
             if self.config.verify_checksums:
                 # Verify checksum matches
                 if self.verify_checksum(file, existing_id):
-                    logger.info(f"File exists and checksum matches: {file.get_name()}")
+                    console.print(f"  [green]✓ Skipped:[/green] File exists with matching checksum")
                     self.skipped_files += 1
+                    if self.progress and self.upload_task is not None:
+                        self.progress.advance(self.upload_task)
                     return existing_id
                 else:
-                    logger.warning(f"File exists but checksum differs: {file.get_name()}")
+                    console.print(f"  [yellow]⚠ Warning:[/yellow] File exists but checksum differs")
                     if not self.config.force_new:
                         self.skipped_files += 1
+                        if self.progress and self.upload_task is not None:
+                            self.progress.advance(self.upload_task)
                         return existing_id
             else:
-                logger.info(f"File already exists: {file.get_name()}")
+                console.print(f"  [green]✓ Skipped:[/green] File already exists")
                 self.skipped_files += 1
+                if self.progress and self.upload_task is not None:
+                    self.progress.advance(self.upload_task)
                 return existing_id
         
         if self.config.list_only:
-            logger.info(f"Would upload: {file.get_path()}")
             return None
         
         # Upload the file
@@ -278,25 +379,42 @@ class AbstractUploader(ABC):
         if file_id:
             self.uploaded_files += 1
             self.uploaded_bytes += file.length()
-            logger.info(f"Successfully uploaded: {file.get_name()}")
+            console.print(f"  [green]✓ Uploaded successfully[/green]")
+            if self.progress and self.upload_task is not None:
+                self.progress.advance(self.upload_task, advance=1)
         else:
             # Track failed upload for retry
             self.failed_files += 1
+            console.print(f"  [red]✗ Upload failed[/red]")
             if hasattr(self, 'failed_uploads'):
                 self.failed_uploads.append((file, parent_path))
+            if self.progress and self.upload_task is not None:
+                self.progress.advance(self.upload_task)
         
         return file_id
 
     def _print_summary(self):
         """Print upload summary statistics."""
-        logger.info("=" * 80)
-        logger.info("Upload Summary")
-        logger.info(f"Total files processed: {self.total_files}")
-        logger.info(f"Files uploaded: {self.uploaded_files}")
-        logger.info(f"Files skipped: {self.skipped_files}")
-        logger.info(f"Files failed: {self.failed_files}")
-        logger.info(f"Total bytes uploaded: {self.uploaded_bytes:,}")
-        logger.info("=" * 80)
+        console.print("\n[bold green]" + "═" * 70)
+        console.print("[bold green]Upload Summary")
+        console.print("═" * 70)
+        
+        console.print(f"[cyan]Total files processed:[/cyan] {self.total_files}")
+        console.print(f"[green]Files uploaded:[/green] {self.uploaded_files}")
+        console.print(f"[yellow]Files skipped:[/yellow] {self.skipped_files}")
+        
+        if self.failed_files > 0:
+            console.print(f"[red]Files failed:[/red] {self.failed_files}")
+        
+        # Format uploaded bytes
+        uploaded_mb = self.uploaded_bytes / (1024 * 1024)
+        if uploaded_mb < 1:
+            uploaded_kb = self.uploaded_bytes / 1024
+            console.print(f"[cyan]Total bytes uploaded:[/cyan] {uploaded_kb:.1f} KB")
+        else:
+            console.print(f"[cyan]Total bytes uploaded:[/cyan] {uploaded_mb:.1f} MB")
+        
+        console.print("[bold green]" + "═" * 70 + "\n")
 
     @abstractmethod
     def validate_configuration(self) -> None:
